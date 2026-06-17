@@ -29,9 +29,10 @@ missing_safety_doc = "warn"
 cloned_instead_of_copied = "warn"
 
 [profile.release]
-opt-level = "z"
-debug = 1
+opt-level = 3
+debug = 0
 lto = "fat"
-strip = true
+strip = "symbols"
 incremental = false
 codegen-units = 1
+panic = "abort"

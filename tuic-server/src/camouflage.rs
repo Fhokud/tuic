@@ -5,16 +5,14 @@ use axum::http::{
 	header::{HOST, HeaderValue},
 };
 use bytes::{Buf, Bytes};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use h3::server;
-use reqwest::{Client, Method, Url};
+use reqwest::{Body, Client, Method, Url};
+use std::io;
 use tracing::{debug, info, warn};
 use tuic_core::quinn::QuinnConnection;
 
 use crate::{AppContext, config::CamouflageConfig};
-
-const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024 * 1024;
-const MAX_RESPONSE_BODY_SIZE: usize = 64 * 1024 * 1024;
 
 pub async fn handle(
 	ctx: Arc<AppContext>,
@@ -26,7 +24,7 @@ pub async fn handle(
 		return Ok(());
 	};
 
-	let (backend, backend_host_override, client) = build_backend_route(camouflage)?;
+	let (backend, backend_host_override, idle_timeout, client) = build_backend_route(camouflage)?;
 
 	info!(
 		id = conn.stable_id() as u32,
@@ -40,28 +38,36 @@ pub async fn handle(
 	let mut h3_conn = server::Connection::new(quic_conn).await?;
 
 	while let Some(resolver) = h3_conn.accept().await? {
-		let (request, mut stream) = resolver.resolve_request().await?;
+		let (request, stream) = resolver.resolve_request().await?;
 		debug!(
 			"[camouflage] incoming h3 request: method={} uri={}",
 			request.method(),
 			request.uri()
 		);
 
-		match forward_request(&client, &backend, backend_host_override.as_deref(), request, &mut stream).await {
-			Ok(()) => {}
-			Err(err) => {
+		let client = client.clone();
+		let backend = backend.clone();
+		let backend_host_override = backend_host_override.clone();
+		tokio::spawn(async move {
+			if let Err(err) = forward_request(
+				&client,
+				&backend,
+				backend_host_override.as_deref(),
+				idle_timeout,
+				request,
+				stream,
+			)
+			.await
+			{
 				warn!("[camouflage] request forwarding failed: {err}");
-				let resp = Response::builder().status(502).body(())?;
-				_ = stream.send_response(resp).await;
-				_ = stream.finish().await;
 			}
-		}
+		});
 	}
 
 	Ok(())
 }
 
-fn build_backend_route(camouflage: &CamouflageConfig) -> eyre::Result<(Url, Option<String>, Client)> {
+fn build_backend_route(camouflage: &CamouflageConfig) -> eyre::Result<(Url, Option<String>, std::time::Duration, Client)> {
 	let mut backend = Url::parse(camouflage.reverse_proxy_url.as_str())?;
 	let backend_host = backend
 		.host_str()
@@ -73,7 +79,8 @@ fn build_backend_route(camouflage: &CamouflageConfig) -> eyre::Result<(Url, Opti
 
 	let mut client_builder = Client::builder()
 		.danger_accept_invalid_certs(camouflage.skip_backend_tls_verify)
-		.timeout(camouflage.request_timeout);
+		.read_timeout(camouflage.request_timeout)
+		.pool_max_idle_per_host(0);
 	let mut backend_host_override = camouflage.reverse_proxy_hostname.clone();
 
 	if let Some(reverse_proxy_hostname) = camouflage.reverse_proxy_hostname.as_deref() {
@@ -87,19 +94,23 @@ fn build_backend_route(camouflage: &CamouflageConfig) -> eyre::Result<(Url, Opti
 	}
 
 	let client = client_builder.build()?;
-	Ok((backend, backend_host_override, client))
+	Ok((backend, backend_host_override, camouflage.request_timeout, client))
 }
 
 async fn forward_request<S>(
 	client: &Client,
 	backend: &Url,
 	backend_host_override: Option<&str>,
+	idle_timeout: std::time::Duration,
 	request: Request<()>,
-	stream: &mut server::RequestStream<S, Bytes>,
+	stream: server::RequestStream<S, Bytes>,
 ) -> eyre::Result<()>
 where
-	S: h3::quic::BidiStream<Bytes>,
+	S: h3::quic::BidiStream<Bytes> + Send + 'static,
+	S::SendStream: Send + 'static,
+	S::RecvStream: Send + 'static,
 {
+	let (mut response_stream, mut request_stream) = stream.split();
 	let target = rewrite_target_url(backend, request.uri())?;
 	let method = Method::from_bytes(request.method().as_str().as_bytes())?;
 	let mut backend_request = client.request(method, target);
@@ -119,12 +130,21 @@ where
 		backend_request = backend_request.header(HOST, host);
 	}
 
-	let request_body = read_request_body(stream).await?;
-	if !request_body.is_empty() {
-		backend_request = backend_request.body(request_body);
+	if let Some(first_chunk) = read_request_body_chunk(&mut request_stream, idle_timeout).await? {
+		let body_stream = stream::once(async move { Ok::<_, io::Error>(first_chunk) })
+			.chain(request_body_stream(request_stream, idle_timeout));
+		backend_request = backend_request.body(Body::wrap_stream(body_stream));
 	}
 
-	let backend_response = backend_request.send().await?;
+	let backend_response = match backend_request.send().await {
+		Ok(response) => response,
+		Err(err) => {
+			let resp = Response::builder().status(502).body(())?;
+			_ = response_stream.send_response(resp).await;
+			_ = response_stream.finish().await;
+			return Err(err.into());
+		}
+	};
 	let status = backend_response.status();
 	let headers = backend_response.headers().clone();
 
@@ -135,48 +155,70 @@ where
 		}
 	}
 	let response = response.body(())?;
-	stream.send_response(response).await?;
+	response_stream.send_response(response).await?;
 
-	let mut body_size = 0usize;
 	let mut body_stream = backend_response.bytes_stream();
 	while let Some(chunk) = body_stream.next().await {
 		let chunk = chunk?;
-		body_size += chunk.len();
-		if body_size > MAX_RESPONSE_BODY_SIZE {
-			return Err(eyre::eyre!(
-				"response body too large: {} bytes (max {})",
-				body_size,
-				MAX_RESPONSE_BODY_SIZE
-			));
-		}
 		if !chunk.is_empty() {
-			stream.send_data(chunk).await?;
+			response_stream.send_data(chunk).await?;
 		}
 	}
-	stream.finish().await?;
+	response_stream.finish().await?;
 	Ok(())
 }
 
-async fn read_request_body<S>(stream: &mut server::RequestStream<S, Bytes>) -> eyre::Result<Bytes>
+async fn read_request_body_chunk<S>(
+	stream: &mut server::RequestStream<S, Bytes>,
+	idle_timeout: std::time::Duration,
+) -> eyre::Result<Option<Bytes>>
 where
-	S: h3::quic::BidiStream<Bytes>,
+	S: h3::quic::RecvStream,
 {
-	let mut body = Vec::new();
-
-	while let Some(mut chunk) = stream.recv_data().await? {
+	if let Some(mut chunk) = recv_data_with_idle_timeout(stream, idle_timeout).await? {
 		let remaining = chunk.remaining();
-		body.extend_from_slice(chunk.copy_to_bytes(remaining).as_ref());
-		if body.len() > MAX_REQUEST_BODY_SIZE {
-			return Err(eyre::eyre!(
-				"request body too large: {} bytes (max {})",
-				body.len(),
-				MAX_REQUEST_BODY_SIZE
-			));
-		}
+		return Ok(Some(chunk.copy_to_bytes(remaining)));
 	}
-	let _ = stream.recv_trailers().await?;
 
-	Ok(Bytes::from(body))
+	let _ = recv_trailers_with_idle_timeout(stream, idle_timeout).await?;
+	Ok(None)
+}
+
+fn request_body_stream<S>(
+	stream: server::RequestStream<S, Bytes>,
+	idle_timeout: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static
+where
+	S: h3::quic::RecvStream + Send + 'static,
+{
+	stream::unfold(Some(stream), move |state| async move {
+		let mut stream = state?;
+		match read_request_body_chunk(&mut stream, idle_timeout).await {
+			Ok(Some(chunk)) => Some((Ok(chunk), Some(stream))),
+			Ok(None) => None,
+			Err(err) => Some((Err(io::Error::other(err)), None)),
+		}
+	})
+}
+
+async fn recv_data_with_idle_timeout<S>(
+	stream: &mut server::RequestStream<S, Bytes>,
+	idle_timeout: std::time::Duration,
+) -> eyre::Result<Option<impl Buf>>
+where
+	S: h3::quic::RecvStream,
+{
+	Ok(tokio::time::timeout(idle_timeout, stream.recv_data()).await??)
+}
+
+async fn recv_trailers_with_idle_timeout<S>(
+	stream: &mut server::RequestStream<S, Bytes>,
+	idle_timeout: std::time::Duration,
+) -> eyre::Result<Option<axum::http::HeaderMap>>
+where
+	S: h3::quic::RecvStream,
+{
+	Ok(tokio::time::timeout(idle_timeout, stream.recv_trailers()).await??)
 }
 
 fn rewrite_target_url(backend: &Url, uri: &Uri) -> eyre::Result<Url> {
