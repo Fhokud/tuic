@@ -67,7 +67,7 @@ impl Connection {
 		let init = async {
 			let conn = if ctx.cfg.zero_rtt_handshake {
 				match conn.into_0rtt() {
-					Ok((conn, _)) => conn,
+					Ok(conn) => conn,
 					Err(conn) => conn.await?,
 				}
 			} else {
@@ -181,13 +181,16 @@ impl Connection {
 	}
 
 	async fn timeout_authenticate(self, timeout: Duration) {
-		time::sleep(timeout).await;
-
-		match self.auth.get() {
-			Some(uuid) => {
-				restful::client_connect(&self.ctx, &uuid, self.inner).await;
+		tokio::select! {
+			() = self.auth.wait() => {
+				if let Some(uuid) = self.auth.get() {
+					restful::client_connect(&self.ctx, &uuid, self.inner).await;
+				}
 			}
-			None => {
+			err = self.inner.closed() => {
+				debug!("connection closed before authentication completed: {err}");
+			}
+			() = time::sleep(timeout) => {
 				warn!("[authenticate] timeout");
 				self.close();
 			}

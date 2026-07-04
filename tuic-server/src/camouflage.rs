@@ -1,18 +1,20 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use axum::http::{
 	HeaderName, Request, Response, Uri,
 	header::{HOST, HeaderValue},
 };
 use bytes::{Buf, Bytes};
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use h3::server;
 use reqwest::{Body, Client, Method, Url};
-use std::io;
+use tokio::{sync::mpsc, task::JoinSet};
 use tracing::{debug, info, warn};
 use tuic_core::quinn::QuinnConnection;
 
 use crate::{AppContext, config::CamouflageConfig};
+
+const RESPONSE_DATA_CHUNK_SIZE: usize = 64 * 1024;
 
 pub async fn handle(
 	ctx: Arc<AppContext>,
@@ -36,6 +38,7 @@ pub async fn handle(
 
 	let quic_conn = crate::h3_quinn_compat::Connection::new_with_prefetched(conn, prefetched_uni, prefetched_bi);
 	let mut h3_conn = server::Connection::new(quic_conn).await?;
+	let mut requests = JoinSet::new();
 
 	while let Some(resolver) = h3_conn.accept().await? {
 		let (request, stream) = resolver.resolve_request().await?;
@@ -48,7 +51,7 @@ pub async fn handle(
 		let client = client.clone();
 		let backend = backend.clone();
 		let backend_host_override = backend_host_override.clone();
-		tokio::spawn(async move {
+		requests.spawn(async move {
 			if let Err(err) = forward_request(
 				&client,
 				&backend,
@@ -62,6 +65,12 @@ pub async fn handle(
 				warn!("[camouflage] request forwarding failed: {err}");
 			}
 		});
+	}
+
+	while let Some(result) = requests.join_next().await {
+		if let Err(err) = result {
+			warn!("[camouflage] request forwarding task failed: {err}");
+		}
 	}
 
 	Ok(())
@@ -79,7 +88,6 @@ fn build_backend_route(camouflage: &CamouflageConfig) -> eyre::Result<(Url, Opti
 
 	let mut client_builder = Client::builder()
 		.danger_accept_invalid_certs(camouflage.skip_backend_tls_verify)
-		.read_timeout(camouflage.request_timeout)
 		.pool_max_idle_per_host(0);
 	let mut backend_host_override = camouflage.reverse_proxy_hostname.clone();
 
@@ -131,8 +139,7 @@ where
 	}
 
 	if let Some(first_chunk) = read_request_body_chunk(&mut request_stream, idle_timeout).await? {
-		let body_stream = stream::once(async move { Ok::<_, io::Error>(first_chunk) })
-			.chain(request_body_stream(request_stream, idle_timeout));
+		let body_stream = request_body_stream(first_chunk, request_stream, idle_timeout);
 		backend_request = backend_request.body(Body::wrap_stream(body_stream));
 	}
 
@@ -157,14 +164,13 @@ where
 	let response = response.body(())?;
 	response_stream.send_response(response).await?;
 
-	let mut body_stream = backend_response.bytes_stream();
-	while let Some(chunk) = body_stream.next().await {
-		let chunk = chunk?;
+	let mut body_stream = backend_response.bytes_stream().map_err(io::Error::other);
+	while let Some(chunk) = recv_stream_item_with_idle_timeout(&mut body_stream, idle_timeout).await? {
 		if !chunk.is_empty() {
-			response_stream.send_data(chunk).await?;
+			send_response_data_with_idle_timeout(&mut response_stream, chunk, idle_timeout).await?;
 		}
 	}
-	response_stream.finish().await?;
+	finish_response_with_idle_timeout(&mut response_stream, idle_timeout).await?;
 	Ok(())
 }
 
@@ -185,20 +191,35 @@ where
 }
 
 fn request_body_stream<S>(
+	first_chunk: Bytes,
 	stream: server::RequestStream<S, Bytes>,
 	idle_timeout: std::time::Duration,
 ) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
 	S: h3::quic::RecvStream + Send + 'static,
 {
-	stream::unfold(Some(stream), move |state| async move {
-		let mut stream = state?;
-		match read_request_body_chunk(&mut stream, idle_timeout).await {
-			Ok(Some(chunk)) => Some((Ok(chunk), Some(stream))),
-			Ok(None) => None,
-			Err(err) => Some((Err(io::Error::other(err)), None)),
+	let (tx, rx) = mpsc::channel(16);
+	tokio::spawn(async move {
+		let mut stream = stream;
+		if tx.send(Ok(first_chunk)).await.is_err() {
+			return;
 		}
-	})
+		loop {
+			match read_request_body_chunk(&mut stream, idle_timeout).await {
+				Ok(Some(chunk)) => {
+					if tx.send(Ok(chunk)).await.is_err() {
+						break;
+					}
+				}
+				Ok(None) => break,
+				Err(err) => {
+					_ = tx.send(Err(io::Error::other(err))).await;
+					break;
+				}
+			}
+		}
+	});
+	stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
 }
 
 async fn recv_data_with_idle_timeout<S>(
@@ -219,6 +240,39 @@ where
 	S: h3::quic::RecvStream,
 {
 	Ok(tokio::time::timeout(idle_timeout, stream.recv_trailers()).await??)
+}
+
+async fn recv_stream_item_with_idle_timeout<S, T>(stream: &mut S, idle_timeout: std::time::Duration) -> eyre::Result<Option<T>>
+where
+	S: futures_util::Stream<Item = Result<T, io::Error>> + Unpin,
+{
+	Ok(tokio::time::timeout(idle_timeout, stream.next()).await?.transpose()?)
+}
+
+async fn send_response_data_with_idle_timeout<S>(
+	stream: &mut server::RequestStream<S, Bytes>,
+	mut chunk: Bytes,
+	idle_timeout: std::time::Duration,
+) -> eyre::Result<()>
+where
+	S: h3::quic::SendStream<Bytes>,
+{
+	while !chunk.is_empty() {
+		let len = chunk.len().min(RESPONSE_DATA_CHUNK_SIZE);
+		let data = chunk.split_to(len);
+		tokio::time::timeout(idle_timeout, stream.send_data(data)).await??;
+	}
+	Ok(())
+}
+
+async fn finish_response_with_idle_timeout<S>(
+	stream: &mut server::RequestStream<S, Bytes>,
+	idle_timeout: std::time::Duration,
+) -> eyre::Result<()>
+where
+	S: h3::quic::SendStream<Bytes>,
+{
+	Ok(tokio::time::timeout(idle_timeout, stream.finish()).await??)
 }
 
 fn rewrite_target_url(backend: &Url, uri: &Uri) -> eyre::Result<Url> {

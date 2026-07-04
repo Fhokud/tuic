@@ -1,7 +1,10 @@
 use std::{
 	collections::HashMap,
 	net::SocketAddr,
-	sync::{Arc, atomic::Ordering},
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 };
 
 use axum::{
@@ -69,10 +72,10 @@ async fn list_online(
 		return (StatusCode::UNAUTHORIZED, Json(HashMap::new()));
 	}
 	let mut result = HashMap::new();
-	for (user, count) in ctx.online_counter.iter() {
-		let count = count.load(Ordering::Relaxed);
+	for (user, cache) in ctx.online_clients.iter() {
+		let count = cache.iter().count();
 		if count != 0 {
-			result.insert(user.to_owned(), count);
+			result.insert(*user, count);
 		}
 	}
 
@@ -91,11 +94,10 @@ async fn list_detailed_online(
 	}
 	let mut result = HashMap::new();
 	for (user, cache) in ctx.online_clients.iter() {
-		let entry_count = cache.entry_count();
-		if entry_count == 0 {
+		let addrs: Vec<SocketAddr> = cache.iter().map(|(_, client)| client.remote_address()).collect();
+		if addrs.is_empty() {
 			continue;
 		}
-		let addrs: Vec<SocketAddr> = cache.iter().map(|(_, client)| client.remote_address()).collect();
 		result.insert(*user, addrs);
 	}
 
@@ -148,38 +150,63 @@ async fn reset_traffic(
 
 pub async fn client_connect(ctx: &AppContext, uuid: &Uuid, conn: QuinnConnection) {
 	if let Some(cfg) = ctx.cfg.restful.as_ref() {
+		if conn.close_reason().is_some() {
+			return;
+		}
+
 		let Some(counter) = ctx.online_counter.get(uuid) else {
 			warn!("UUID {uuid} not in users table during client_connect, closing connection");
 			conn.close(VarInt::from_u32(6003), b"Internal error");
 			return;
 		};
-		let current = counter.fetch_add(1, Ordering::Release);
-		if cfg.maximum_clients_per_user != 0 && current > cfg.maximum_clients_per_user {
-			conn.close(VarInt::from_u32(6001), b"Reached maximum clients limitation");
-			return;
-		}
+
 		let cap = if cfg.maximum_clients_per_user == 0 {
+			counter.fetch_add(1, Ordering::AcqRel);
 			10000
 		} else {
-			cfg.maximum_clients_per_user as u64
+			let max = cfg.maximum_clients_per_user;
+			if counter
+				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+					(count < max).then_some(count + 1)
+				})
+				.is_err()
+			{
+				conn.close(VarInt::from_u32(6001), b"Reached maximum clients limitation");
+				return;
+			}
+			max as u64
 		};
 		let cache = ctx.online_clients.get_with(*uuid, async { Arc::new(Cache::new(cap)) }).await;
+
+		if conn.close_reason().is_some() {
+			decrement_online_counter(counter);
+			return;
+		}
 
 		let client: crate::compat::QuicClient = conn.into();
 		cache.insert(client.stable_id(), client).await;
 	}
 }
 pub async fn client_disconnect(ctx: &AppContext, uuid: &Uuid, conn: QuinnConnection) {
-	if let Some(counter) = ctx.online_counter.get(uuid) {
-		counter.fetch_sub(1, Ordering::SeqCst);
-	} else {
-		warn!("UUID {uuid} not in users table during client_disconnect");
+	let client: crate::compat::QuicClient = conn.into();
+	let mut was_online = false;
+	if let Some(cache) = ctx.online_clients.get(uuid).await {
+		let id = client.stable_id();
+		was_online = cache.get(&id).await.is_some();
+		cache.invalidate(&id).await;
 	}
 
-	if let Some(cache) = ctx.online_clients.get(uuid).await {
-		let client: crate::compat::QuicClient = conn.into();
-		cache.invalidate(&client.stable_id()).await;
+	if was_online {
+		if let Some(counter) = ctx.online_counter.get(uuid) {
+			decrement_online_counter(counter);
+		} else {
+			warn!("UUID {uuid} not in users table during client_disconnect");
+		}
 	}
+}
+
+fn decrement_online_counter(counter: &AtomicUsize) {
+	let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
 }
 
 pub fn traffic_tx(ctx: &AppContext, uuid: &Uuid, size: usize) {
