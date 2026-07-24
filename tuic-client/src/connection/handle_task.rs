@@ -6,17 +6,20 @@ use tokio::time;
 use tracing::{debug, info, warn};
 use tuic_core::{
 	Address,
-	quinn::{Connect, Packet, ZeroRttAccepted},
+	quinn::{Connect, Packet},
 };
 
 use super::Connection;
 use crate::{error::Error, utils::UdpRelayMode};
 
 impl Connection {
-	pub async fn authenticate(self, zero_rtt_accepted: Option<ZeroRttAccepted>) {
-		if let Some(zero_rtt_accepted) = zero_rtt_accepted {
+	pub async fn authenticate(self, wait_for_handshake: bool) {
+		if wait_for_handshake {
 			debug!("[relay] [authenticate] waiting for connection to be fully established");
-			zero_rtt_accepted.await;
+			if let Err(err) = self.conn.authenticated().await {
+				warn!("[relay] [authenticate] connection failed before authentication: {err}");
+				return;
+			}
 		}
 
 		debug!("[relay] [authenticate] sending authentication");

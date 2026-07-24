@@ -218,6 +218,17 @@ impl Connection {
 
 			stream.set_nodelay(true)?;
 
+			// In the regular mode, never relay data before authentication. With
+			// 0-RTT explicitly enabled, relay speculatively and validate the
+			// unchanged TLS-exporter-based authentication as soon as 1-RTT keys
+			// become available. A failed authentication closes the connection.
+			if !self.ctx.cfg.zero_rtt_handshake && !self.auth.is_authenticated() {
+				tokio::select! {
+					() = self.auth.wait() => {}
+					err = self.inner.closed() => return Err(Error::from(err).into()),
+				};
+			}
+
 			// a -> b tx
 			// a <- b rx
 			let (tx, rx, err) = copy_io(&mut conn, &mut stream).await;
@@ -227,6 +238,13 @@ impl Connection {
 				_ = conn.finish().await;
 			}
 			_ = stream.shutdown().await;
+
+			if !self.auth.is_authenticated() {
+				tokio::select! {
+					() = self.auth.wait() => {}
+					err = self.inner.closed() => return Err(Error::from(err).into()),
+				};
+			}
 
 			let uuid = self.auth.get().ok_or_eyre("Unexpected authorization state")?;
 			restful::traffic_tx(&self.ctx, &uuid, tx);

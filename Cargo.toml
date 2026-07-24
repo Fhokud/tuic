@@ -29,7 +29,7 @@ missing_safety_doc = "warn"
 cloned_instead_of_copied = "warn"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 debug = 1
 lto = "fat"
 strip = true

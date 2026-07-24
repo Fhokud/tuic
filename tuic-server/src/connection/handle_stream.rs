@@ -30,7 +30,7 @@ impl Connection {
 				return Err(Error::UnexpectedPacketSource);
 			}
 
-			Ok(task)
+			Ok::<_, Error>(task)
 		};
 
 		match pre_process.await {
@@ -53,14 +53,7 @@ impl Connection {
 				.await
 				.map_err(|_| Error::TaskNegotiationTimeout)??;
 
-			if !self.auth.is_authenticated() {
-				tokio::select! {
-					() = self.auth.wait() => {}
-					err = self.inner.closed() => return Err(Error::from(err)),
-				};
-			}
-
-			Ok(task)
+			Ok::<_, Error>(task)
 		};
 
 		match pre_process.await {

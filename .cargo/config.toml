@@ -1,5 +1,13 @@
 [build]
 #rustc-wrapper = "sccache"
 
+# Intel Xeon E5-2690 (Sandy Bridge) baseline.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=sandybridge"]
+
+# Intel Core Ultra 7 258V (Lunar Lake), with VAES explicitly enabled.
+# Comment out the Sandy Bridge rustflags above and uncomment this line to use it.
+# rustflags = ["-C", "target-cpu=lunarlake", "-C", "target-feature=+vaes"]
+
 [env]
 RUSTC_BOOTSTRAP = { value = "1" }

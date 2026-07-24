@@ -15,7 +15,7 @@ use tokio::{sync::RwLock as AsyncRwLock, time};
 use tracing::{debug, info, warn};
 use tuic_core::quinn::{
 	ClientConfig, Connection as Model, Endpoint as QuinnEndpoint, EndpointConfig, QuinnConnection, TokioRuntime,
-	TransportConfig, VarInt, ZeroRttAccepted,
+	TransportConfig, VarInt,
 	bbr::BbrConfig,
 	congestion::{Bbr3Config, CubicConfig, NewRenoConfig},
 	crypto::rustls::QuicClientConfig,
@@ -270,7 +270,7 @@ impl Connection {
 	#[allow(clippy::too_many_arguments)]
 	fn new(
 		conn: QuinnConnection,
-		zero_rtt_accepted: Option<ZeroRttAccepted>,
+		wait_for_handshake: bool,
 		udp_relay_mode: UdpRelayMode,
 		uuid: Uuid,
 		password: Arc<[u8]>,
@@ -291,23 +291,17 @@ impl Connection {
 			fwd_udp_sessions,
 		};
 
-		tokio::spawn(conn.clone().init(zero_rtt_accepted, heartbeat, gc_interval, gc_lifetime));
+		tokio::spawn(conn.clone().init(wait_for_handshake, heartbeat, gc_interval, gc_lifetime));
 
 		conn
 	}
 
 	/// Initialize background tasks for authentication, heartbeat, and garbage
 	/// collection
-	async fn init(
-		self,
-		zero_rtt_accepted: Option<ZeroRttAccepted>,
-		heartbeat: Duration,
-		gc_interval: Duration,
-		gc_lifetime: Duration,
-	) {
+	async fn init(self, wait_for_handshake: bool, heartbeat: Duration, gc_interval: Duration, gc_lifetime: Duration) {
 		info!("[relay] connection established");
 
-		tokio::spawn(self.clone().authenticate(zero_rtt_accepted));
+		tokio::spawn(self.clone().authenticate(wait_for_handshake));
 		tokio::spawn(self.clone().heartbeat(heartbeat));
 		tokio::spawn(self.clone().collect_garbage(gc_interval, gc_lifetime));
 
@@ -408,22 +402,22 @@ impl Endpoint {
 
 		let connect_to = async {
 			let conn = self.ep.connect(server_addr, self.server.server_name())?;
-			let (conn, zero_rtt_accepted) = if self.zero_rtt_handshake {
+			let (conn, wait_for_handshake) = if self.zero_rtt_handshake {
 				match conn.into_0rtt() {
-					Ok((conn, zero_rtt_accepted)) => (conn, Some(zero_rtt_accepted)),
-					Err(conn) => (conn.await?, None),
+					Ok(conn) => (conn, true),
+					Err(conn) => (conn.await?, false),
 				}
 			} else {
-				(conn.await?, None)
+				(conn.await?, false)
 			};
 
-			Ok((conn, zero_rtt_accepted))
+			Ok((conn, wait_for_handshake))
 		};
 
 		match connect_to.await {
-			Ok((conn, zero_rtt_accepted)) => Ok(Connection::new(
+			Ok((conn, wait_for_handshake)) => Ok(Connection::new(
 				conn,
-				zero_rtt_accepted,
+				wait_for_handshake,
 				self.udp_relay_mode,
 				self.uuid,
 				self.password.clone(),
